@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 
+import importlib
 import os
 import sys
-import importlib
 from inspect import Parameter, signature
+
+from app.cmd import execute
 
 
 def get_module_name(argv: list[str]) -> str:
@@ -47,9 +49,9 @@ def get_fn_parameters_from_argv(fn, argv: list[str]):
   args, kwargs = parse_parameters_from_argv(argv)
   parameters = {}
   for index, param in enumerate(signature(fn).parameters.values()):
-    assert (
-      param.kind == Parameter.POSITIONAL_OR_KEYWORD
-    ), "Parameter '{}' is not supported".format(param.name)
+    assert param.kind == Parameter.POSITIONAL_OR_KEYWORD, (
+      "Parameter '{}' is not supported".format(param.name)
+    )
 
     annotation = param.annotation
     if annotation == Parameter.empty:
@@ -81,10 +83,32 @@ def load_argv() -> list[str]:
   return lines
 
 
+def load_env():
+  with open("etc/env") as f:
+    lines = f.readlines()
+  lines = [line.strip() for line in lines]
+  lines = [line for line in lines if not line.startswith("#")]
+  lines = [line.strip() for line in lines]
+  lines = [line for line in lines if line]
+  for line in lines:
+    parts = line.split("=")
+    assert len(parts) == 2
+    k, v = parts[0].strip(), parts[1].strip()
+    os.environ[k] = v
+
+
 def main():
+  try:
+    load_env()
+  except Exception:
+    pass
+
   argv = load_argv()
   module_name = get_module_name(argv)
   module = importlib.import_module(module_name)
+
+  if execute(argv[2:]):
+    return
 
   fn_name = argv[2] if len(argv) > 2 else "main"
   fn = getattr(module, fn_name, None)
