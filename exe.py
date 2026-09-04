@@ -2,16 +2,214 @@
 
 import importlib
 import os
+import re
 import sys
 from inspect import Parameter, signature
-from typing import Any, Literal
+from json import loads
+from typing import Any, Literal, TypeVar
 
 import msgspec
 
-from app.cmd import cmd_to_params
 from app.context import create_app_context
+from app.error import AppError
 from app.message import convert_message
 from app.types import AppContextT
+
+CmdToken = int | float | str | bool | None
+CmdTokenType = TypeVar("CmdTokenType", bound=CmdToken)
+
+
+def split_tokens(cmd: str) -> list[CmdToken]:
+  """
+  Split a string into tokens with automatic type conversion.
+
+  Rules:
+    - Double-quoted strings (e.g. "Hello World") are kept as a single string token.
+    - Unquoted tokens that are valid integers become int.
+    - Unquoted tokens that are valid floats become float.
+    - Unquoted "true" / "false" become bool.
+    - Unquoted "null" becomes None.
+    - Everything else stays as str.
+
+  Examples:
+      >>> split_tokens("1 2 3")
+      [1, 2, 3]
+      >>> split_tokens("a b c")
+      ['a', 'b', 'c']
+      >>> split_tokens('"Hello World" 1 2 3')
+      ['Hello World', 1, 2, 3]
+      >>> split_tokens('"2"')
+      ['2']
+      >>> split_tokens("true")
+      [True]
+      >>> split_tokens("null")
+      [None]
+      >>> split_tokens("x=1")
+      ['x', '=', 1]
+      >>> split_tokens("x= 1")
+      ['x', '=', 1]
+      >>> split_tokens("x = 1")
+      ['x', '=', 1]
+      >>> split_tokens('x="hi"')
+      ['x', '=', 'hi']
+  """
+  raw_tokens = re.findall(
+    r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|=|[^\s=]+', cmd
+  )
+
+  result: list = []
+  for token in raw_tokens:
+    if token == "true":
+      result.append(True)
+    elif token == "false":
+      result.append(False)
+    elif token == "null":
+      result.append(None)
+    elif token.startswith('"') and token.endswith('"'):
+      result.append(loads(token))
+    else:
+      try:
+        result.append(int(token))
+        continue
+      except ValueError:
+        pass
+      try:
+        result.append(float(token))
+        continue
+      except ValueError:
+        pass
+      result.append(token)
+
+  return result
+
+
+class CmdArgsBuilder:
+  def __init__(self, txt: str) -> None:
+    tokens = split_tokens(txt)
+    self._cursor = 0
+    self._equal = "="
+    self._scoper = "."
+    self._tokens = tokens
+    self._scope_suffix = ":"
+    self.current_scope = ""
+    self._length = len(tokens)
+    self._array_placeholder = "$"
+    self._args: list[CmdToken] = []
+    self._kw_args: dict[str, Any] = {"": {}}
+    self._possible_lists: dict[str, bool] = {}
+
+  def to_params(self, type: type[msgspec.Struct]):
+    args, kwargs = self._build()
+    if len(args) != 0:
+      fields = msgspec.structs.fields(type)
+      for field, value in zip(fields, args):
+        kwargs[field.name] = value
+    return convert_message(kwargs, type)
+
+  def _build(self):
+    while self._cursor < self._length:
+      key = self._tokens[self._cursor]
+      self._cursor += 1
+      if not isinstance(key, str):
+        self._args.append(key)
+        continue
+      if key.endswith(self._scope_suffix):
+        self._change_scope(key)
+        continue
+      if (
+        self._cursor == self._length
+        or self._tokens[self._cursor] != self._equal
+      ):
+        self._args.append(key)
+        continue
+      self._handle_key_value(key)
+    self._build_lists()
+    return self._args, self._kw_args[""]
+
+  def _handle_key_value(self, key: str):
+    if self._tokens[self._cursor] != self._equal:
+      raise AppError("value-required", f"value is required for {key}")
+    self._cursor += 1
+    if self._cursor >= self._length:
+      raise AppError("value-required", f"value is required for {key}")
+    value = self._tokens[self._cursor]
+    self._cursor += 1
+    if len(self.current_scope) != 0:
+      key = self.current_scope + "." + key
+    self._apply_key(key, value)
+
+  def _change_scope(self, key: str):
+    key = key[: -len(self._scope_suffix)]
+    if key.endswith(self._array_placeholder):
+      parts = key.split(self._scoper)
+      scope = self._get_value_for_scope(parts)
+      key = key[: -len(self._array_placeholder)] + str(len(scope))
+    self.current_scope = key
+
+  def _build_lists(self):
+    keys = sorted(self._possible_lists.keys(), reverse=True)
+    for key in keys:
+      value = self._kw_args[key]
+      required = self._possible_lists[key]
+      if self._can_be_valid_list(value):
+        self._build_list(key, value)
+      elif required:
+        raise AppError("invalid-cmd-token-for-json")
+
+  def _can_be_valid_list(self, value: dict[str, Any]):
+    for i in range(len(value)):
+      if str(i) not in value:
+        return False
+    return True
+
+  def _build_list(self, key: str, value: dict[str, Any]):
+    li = [value[str(i)] for i in range(len(value))]
+    if len(key) == 0:
+      self._kw_args[""] = li
+    else:
+      parts = key.split(self._scoper)
+      scope, key = self._scoper.join(parts[:-1]), parts[-1]
+      self._kw_args[scope][key] = [value[str(i)] for i in range(len(value))]
+
+  def _add_to_lists(self, parts: list[str], required: bool):
+    key = self._scoper.join(parts)
+    value = self._possible_lists.get(key, False)
+    self._possible_lists[key] = value or required
+
+  def _apply_key(self, key: str, value: CmdToken):
+    parts = key.split(self._scoper)
+    scope = self._get_value_for_scope(parts)
+    key = parts[-1]
+    if key == self._array_placeholder:
+      scope[str(len(scope))] = value
+      self._add_to_lists(parts[:-1], True)
+      self._possible_lists[self._scoper.join(parts[:-1])]
+    else:
+      scope[key] = value
+      if key.isdigit():
+        self._add_to_lists(parts[:-1], False)
+
+  def _get_value_for_scope(self, parts: list[str]) -> dict[str, Any]:
+    cursor = 0
+    length = len(parts) - 1
+    value = self._kw_args[""]
+    while cursor < length:
+      part = parts[cursor]
+      cursor += 1
+      key = self._scoper.join(parts[:cursor])
+      if part not in value:
+        subvalue = {}
+        value[part] = subvalue
+        self._kw_args[key] = subvalue
+        if part.isdigit():
+          # todo: verify this when cursor is 0
+          self._add_to_lists(parts[: cursor - 1], False)
+      else:
+        subvalue = value[part]
+        if not isinstance(subvalue, dict):
+          raise AppError("invalid-cmd-token-for-json")
+      value = subvalue
+    return value
 
 
 def get_module_name(argv: list[str]) -> str:
@@ -97,12 +295,11 @@ def main():
   if fn is None:
     raise RuntimeError(f"{fn_name} is not definend in {module_name}")
   requires_context, params_type = get_params_type(fn_name, fn)
-  data = cmd_to_params(" ".join(argv[3:]), params_type[1])
-  struct = convert_message(data, params_type[1])
-  params = (
-    {"params": struct}
+  data = CmdArgsBuilder(" ".join(argv[3:])).to_params(params_type[1])
+  params: dict[str, Any] = (
+    {"params": data}
     if params_type[0] == "single"
-    else msgspec.structs.asdict(struct)
+    else msgspec.structs.asdict(data)
   )
   if requires_context:
     params["ctx"] = create_app_context()
