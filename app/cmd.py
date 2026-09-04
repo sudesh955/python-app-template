@@ -2,58 +2,37 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from inspect import signature, Parameter
-from typing import Any, Generic, Literal, Type, TypeVar, TypedDict
+from inspect import Parameter, Signature, signature
+from types import NoneType
+from typing import Any, Literal, TypeVar
 
 import msgspec
 
-from app.context import create_app_context
 from app.error import AppError
-from app.message import decode_message, Struct
+from app.message import (
+  convert_message,
+  encode_message,
+  schema_hook,
+)
 from app.types import AppContextT
 
 Params = TypeVar("Params")
 CmdToken = int | float | str | bool | None
 CmdTokenType = TypeVar("CmdTokenType", bound=CmdToken)
-HandlerFunction = TypeVar("HandlerFunction", bound=Callable)
-CommandHandlerKind = Literal[
-  "no-params", "with-context", "with-argv", "with-params"
+type CommandHandler = Callable
+ParamsFactory = Callable[[Any], Params]
+CmdFunction = TypeVar("CmdFunction", bound=CommandHandler)
+type ParamsType = tuple[
+  Literal["single", "multiple"], type[msgspec.Struct | None]
 ]
-
-
-class CommandHandleWithNoParams(TypedDict):
-  kind: Literal["no-params"]
-  fn: Callable[[], None]
-
-
-class CommandHandlerWithContext(TypedDict):
-  kind: Literal["with-context"]
-  fn: Callable[[AppContextT], None]
-
-
-class CommandHandlerWithArgv(TypedDict):
-  kind: Literal["with-argv"]
-  fn: Callable[["Argv"], None]
-
-
-class CommandHandlerWithParams(TypedDict, Generic[Params]):
-  kind: Literal["with-params"]
-  fn: Callable[[AppContextT, Params], None]
-
-
-CommandHandler = (
-  CommandHandlerWithArgv
-  | CommandHandlerWithParams
-  | CommandHandleWithNoParams
-  | CommandHandlerWithContext
-)
+cmds: dict[str, "Command | Literal[True]"] = {}
+fns: dict[Callable, str] = {}
+cmd_name_scoper = "_"
 
 
 @dataclass
 class Argv:
   items: list[CmdToken]
-  ctx: "AppContextT | None" = None
-
   _cursor = 0
 
   def get(self):
@@ -61,14 +40,14 @@ class Argv:
       return self.items[self._cursor]
     return None
 
-  def next(self, typ: Type[CmdTokenType]) -> CmdTokenType:
+  def next(self, typ: type[CmdTokenType]) -> CmdTokenType:
     value = self.get()
     if not isinstance(value, typ):
       raise AppError("invalid_cmd_type")
     self._cursor += 1
     return value
 
-  def check(self, typ: Type[CmdTokenType]) -> tuple[CmdTokenType, bool]:
+  def check(self, typ: type[CmdTokenType]) -> tuple[CmdTokenType, bool]:
     value = self.get()
     if not isinstance(value, typ):
       return None, False  # type: ignore
@@ -83,128 +62,186 @@ class Argv:
   def count(self):
     return len(self.items)
 
-  def to_json(self):
-    builder = CmdJsonBuilder(self.items, self._cursor)
-    data = builder.build()
-    self._cursor = builder.cursor
-    return data
-
-
-@dataclass
-class Command(Generic[Params]):
-  subcommands: dict[str, "Command"]
-  handler: CommandHandler | None = None
-  params_type: type[Params] | None = None
-
-  def execute(self, argv: Argv):
-    handler = self.handler
-    if handler is None:
-      return False
-    if handler["kind"] == "no-params":
-      handler["fn"]()
-    elif handler["kind"] == "with-argv":
-      handler["fn"](argv)
-    elif handler["kind"] == "with-context":
-      assert argv.ctx is not None
-      handler["fn"](argv.ctx)
+  def to_params(self, typ: type[msgspec.Struct | None]):
+    args, kwargs = CmdArgsBuilder(self.items[self._cursor :]).build()
+    if typ is NoneType:
+      if len(args) == 0 and len(kwargs) == 0:
+        return
+      else:
+        raise AppError("no-args-are-allowed")
+    elif len(args) == 0:
+      return kwargs
     else:
-      assert self.params_type is not None
-      try:
-        params = decode_message(argv.to_json(), self.params_type)
-      except msgspec.ValidationError as e:
-        print(e)
-        raise AppError("invalid-command-params")
-      assert argv.ctx is not None
-      handler["fn"](argv.ctx, params)
-    return True
-
-
-class MainCommandParams(Struct):
-  config: str = "etc/config.toml"
+      fields = msgspec.structs.fields(typ)
+      for field, value in zip(fields, args):
+        kwargs[field.name] = value
+      return kwargs
 
 
 @dataclass
-class MainCommand(Command):
-  def __init__(self):
-    super().__init__({}, {"kind": "with-argv", "fn": MainCommand.main})
+class Command:
+  name: str
+  return_type: type
+  requires_context: bool
+  handler: CommandHandler
+  params_type: ParamsType
 
-  @staticmethod
-  def main(argv: Argv):
-    params = decode_message(argv.to_json(), MainCommandParams)
-    argv.ctx = create_app_context(params.config)
+  def validate(self, args: Any):
+    if self.params_type[1] is not NoneType:
+      try:
+        params = convert_message(args, self.params_type[1])  # type: ignore
+      except msgspec.ValidationError as e:
+        print(e, self.params_type, args)
+        raise AppError("invalid-command-params")
+    elif args:
+      raise AppError("invalid-command-params")
+    else:
+      params = None
+    return params
+
+  def execute(self, ctx: AppContextT, args: Any):
+    params = self.validate(args)
+    return self._execute_work(ctx, params)
+
+  def _execute_work(self, ctx: Any, argv: Any) -> Any:
+    params = (
+      {"params": argv}
+      if self.params_type[0] == "single"
+      else {}
+      if argv is None
+      else msgspec.structs.asdict(argv)
+    )
+    if self.requires_context:
+      params["ctx"] = ctx
+    result = self.handler(**params)
+    if callable(result):
+      result = result()
+    return result
 
 
-Main = MainCommand()
-
-
-def cmd(*prefixes: str, argv: Type[Params] | None = None):
-  assert len(prefixes) != 0, "name of command is required"
-
-  def wrapper(fn: HandlerFunction) -> HandlerFunction:
+def cmd(*names: str):
+  def wrapper(fn: CmdFunction) -> CmdFunction:
+    cmd_names = names if len(names) != 0 else fn.__name__.split("_")
+    name = cmd_names[0]
+    for i in range(1, len(cmd_names)):
+      if name not in cmds:
+        cmds[name] = True
+      name = name + cmd_name_scoper + cmd_names[i]
+    if cmds.get(name, True) is not True:
+      raise AppError("unique-command-error", f"{name} is already registered")
     s = signature(fn)
-    kind: CommandHandlerKind = "no-params"
-    for index, param in enumerate(s.parameters.values()):
-      assert param.kind == Parameter.POSITIONAL_OR_KEYWORD, (
-        f"Parameter '{param.name}' is not supported"
-      )
-      annotation = param.annotation
-      if annotation == Parameter.empty:
-        raise RuntimeError("annotation is required")
-      elif index >= 2:
-        raise RuntimeError("invalid number of arguments")
-      elif index == 0:
-        if annotation == Argv:
-          kind = "with-argv"
-        elif annotation == AppContextT:
-          kind = "with-context"
-      elif index == 1:
-        assert kind == "with-context"
-        kind = "with-params"
-    handler: CommandHandler = {"kind": kind, "fn": fn}  # type: ignore
-
-    cmd = Main
-    for prefix in prefixes:
-      it = cmd.subcommands.get(prefix)
-      if it is None:
-        it = Command({}, params_type=argv)
-        cmd.subcommands[prefix] = it
-      cmd = it
-    assert cmd.handler is None, f"{' '.join(prefixes)} is already registered"
-    cmd.handler = handler
+    return_type = s.return_annotation
+    requires_context, params_type = _get_params_type(name, s)
+    cmds[name] = Command(
+      name=name,
+      handler=fn,
+      params_type=params_type,
+      return_type=return_type,
+      requires_context=requires_context,
+    )
+    fns[fn] = name
     return fn
 
   return wrapper
 
 
-def execute(txt: list[str]) -> bool:
-  if len(txt) != 0 and txt[0] not in Main.subcommands:
-    return False
-  tokens: list[CmdToken] = []
-  for it in txt:
-    tokens.extend(_split_tokens(it))
-  command = Main
-  argv = Argv(tokens)
-  while True:
-    command.execute(argv)
-    cmd, ok = argv.check(str)
-    if not ok:
-      return True
-    subcommand = command.subcommands.get(cmd)
-    if subcommand is None:
-      raise RuntimeError(f"subommand '{cmd}' not found")
-    command = subcommand
+def get_command_by_fn(fn: Callable) -> None | Command:
+  name = fns.get(fn)
+  if name is None:
+    return
+  cmd = cmds[name]
+  assert isinstance(cmd, Command)
+  return cmd
 
 
-class CmdJsonBuilder:
-  def __init__(self, tokens: list[CmdToken], cursor: int = 0) -> None:
+def _get_params_type(method: str, s: Signature) -> tuple[bool, ParamsType]:
+  parameters = s.parameters
+  names = list(parameters.keys())
+  requires_context = (
+    len(names) > 0
+    and names[0] == "ctx"
+    and (
+      parameters["ctx"].annotation is AppContextT
+      or parameters["ctx"].annotation == "AppContextT"
+    )
+  )
+  is_single = (
+    requires_context and len(s.parameters) == 2 and names[1] == "params"
+  )
+  if is_single:
+    return True, ("single", s.parameters["params"].annotation)
+  if requires_context:
+    names = names[1:]
+  fields = [
+    (name, parameters[name].annotation, parameters[name].default)
+    if parameters[name].default is not Parameter.empty
+    else (name, parameters[name].annotation)
+    for name in names
+  ]
+  struct = (
+    msgspec.defstruct(
+      method.title().replace(cmd_name_scoper, "") + "Params",
+      fields,
+    )
+    if len(fields) != 0
+    else NoneType
+  )
+  return requires_context, ("multiple", struct)
+
+
+def _match(txt: str):
+  argv = _split_tokens(txt)
+  names: list[str] = []
+  for it in argv:
+    if not isinstance(it, str) or it in ("--", "="):
+      break
+    names.append(it)
+  if len(names) == 0:
+    raise AppError("invalid-command", f"invalid command: {txt}")
+  index = 0
+  cmd: Command | None = None
+  for i, it in enumerate(names, 1):
+    key = cmd_name_scoper.join(names[:i])
+    c = cmds.get(key)
+    if c is None:
+      break
+    if isinstance(c, Command):
+      cmd = c
+      index = i
+  if not isinstance(cmd, Command):
+    raise AppError("invalid-command", txt)
+  return cmd, argv[index:]
+
+
+def validate_txt(txt: str):
+  cmd, argv = _match(txt)
+  cmd.validate(Argv(argv).to_params(cmd.params_type[1]))
+
+
+def execute_txt(ctx: AppContextT, txt: str):
+  cmd, argv = _match(txt)
+  cmd.execute(ctx, Argv(argv).to_params(cmd.params_type[1]))
+
+
+def execute_with_message(ctx: AppContextT, name: str, message: bytes) -> bytes:
+  cmd = cmds.get(name)
+  if not isinstance(cmd, Command):
+    raise AppError("cmd-not-found", f"{name} is not a cmd")
+  result = cmd.execute(ctx, convert_message(message, cmd.params_type[1]))
+  return encode_message(result)
+
+
+class CmdArgsBuilder:
+  def __init__(self, tokens: list[CmdToken]) -> None:
+    self.cursor = 0
     self.equal = "="
     self.scoper = "."
-    self.cursor = cursor
     self.tokens = tokens
     self.scope_suffix = ":"
     self.current_scope = ""
     self.length = len(tokens)
     self.array_placeholder = "$"
+    self.args: list[CmdToken] = []
     self.values: dict[str, Any] = {"": {}}
     self.possible_lists: dict[str, bool] = {}
 
@@ -213,30 +250,29 @@ class CmdJsonBuilder:
       key = self.tokens[self.cursor]
       self.cursor += 1
       if not isinstance(key, str):
-        raise AppError("invalid-cmd-token-for-json")
+        self.args.append(key)
+        continue
       if key.endswith(self.scope_suffix):
         self._change_scope(key)
         continue
-      elif not self._handle_key_value(key):
-        self.cursor -= 1
-        break
+      if self.cursor == self.length or self.tokens[self.cursor] != self.equal:
+        self.args.append(key)
+        continue
+      self._handle_key_value(key)
     self._build_lists()
-    return self.values[""]
+    return self.args, self.values[""]
 
-  def _handle_key_value(self, key: str) -> bool:
-    if self.cursor >= self.length:
-      return False
+  def _handle_key_value(self, key: str):
     if self.tokens[self.cursor] != self.equal:
-      return False
+      raise AppError("value-required", f"value is required for {key}")
     self.cursor += 1
     if self.cursor >= self.length:
-      raise AppError("invalid-cmd-token-for-json-expected-value-after-key")
+      raise AppError("value-required", f"value is required for {key}")
     value = self.tokens[self.cursor]
     self.cursor += 1
     if len(self.current_scope) != 0:
       key = self.current_scope + "." + key
     self._apply_key(key, value)
-    return True
 
   def _change_scope(self, key: str):
     key = key[: -len(self.scope_suffix)]
@@ -376,38 +412,110 @@ def _split_tokens(cmd: str) -> list[CmdToken]:
   return result
 
 
-def cmd_to_json(txt: str):
-  return CmdJsonBuilder(_split_tokens(txt)).build()
+def cmd_to_params(txt: str, typ: type[None | msgspec.Struct]):
+  return Argv(_split_tokens(txt)).to_params(typ)
 
 
-def test(filename: str):
+def cmd_to_args(txt: str):
+  return CmdArgsBuilder(_split_tokens(txt)).build()
+
+
+def test_cmd_to_json_with_file(filename: str):
   with open(filename, "r") as f:
     txt = f.read()
-  print(cmd_to_json(txt))
+  print(cmd_to_args(txt))
 
 
-def main(txt: str):
-  print(cmd_to_json(txt))
-  assert cmd_to_json("x=1 y=1") == {"x": 1, "y": 1}
-  assert cmd_to_json("x.y=1") == {"x": {"y": 1}}
-  assert cmd_to_json("x.0=1 x.1=1") == {"x": [1, 1]}
-  assert cmd_to_json("x.$=1 x.$=1") == {"x": [1, 1]}
-  assert cmd_to_json("x: $=1 $=1") == {"x": [1, 1]}
-  assert cmd_to_json("0.x=1 0.y=2 1.x=3 1.y=4") == [
-    {"x": 1, "y": 2},
-    {"x": 3, "y": 4},
-  ]
-  assert cmd_to_json("0: x=1 y=2 1: x=3 y=4") == [
-    {"x": 1, "y": 2},
-    {"x": 3, "y": 4},
-  ]
-  assert cmd_to_json("$: x=1 y=2 $: x=3 y=4") == [
-    {"x": 1, "y": 2},
-    {"x": 3, "y": 4},
-  ]
-  assert cmd_to_json("a.$: x=1 y=2 a.$: x=3 y=4") == {
-    "a": [
+def test_cmd_to_json():
+  assert cmd_to_args("1 2 3") == ([1, 2, 3], {})
+  assert cmd_to_args("x=1 y=1") == ([], {"x": 1, "y": 1})
+  assert cmd_to_args("x.y=1") == ([], {"x": {"y": 1}})
+  assert cmd_to_args("x.0=1 x.1=1") == ([], {"x": [1, 1]})
+  assert cmd_to_args("x.$=1 x.$=1") == ([], {"x": [1, 1]})
+  assert cmd_to_args("x: $=1 $=1") == ([], {"x": [1, 1]})
+  assert cmd_to_args("0.x=1 0.y=2 1.x=3 1.y=4") == (
+    [],
+    [
       {"x": 1, "y": 2},
       {"x": 3, "y": 4},
-    ]
-  }
+    ],
+  )
+  assert cmd_to_args("0: x=1 y=2 1: x=3 y=4") == (
+    [],
+    [
+      {"x": 1, "y": 2},
+      {"x": 3, "y": 4},
+    ],
+  )
+  assert cmd_to_args("$: x=1 y=2 $: x=3 y=4") == (
+    [],
+    [
+      {"x": 1, "y": 2},
+      {"x": 3, "y": 4},
+    ],
+  )
+  assert cmd_to_args("a.$: x=1 y=2 a.$: x=3 y=4") == (
+    [],
+    {
+      "a": [
+        {"x": 1, "y": 2},
+        {"x": 3, "y": 4},
+      ]
+    },
+  )
+
+
+def install_cmd():
+  import importlib
+
+  importlib.import_module("app.cmds")
+  importlib.import_module("app.diode")
+  importlib.import_module("app.plane")
+  importlib.import_module("app.optics")
+  importlib.import_module("app.record")
+  importlib.import_module("app.capture")
+  importlib.import_module("app.autoled")
+  importlib.import_module("app.miniature")
+  importlib.import_module("app.controller")
+
+
+def generate_rpc_types():
+  import copy
+  import subprocess
+
+  install_cmd()
+
+  remote_procedures: list[tuple[str, type]] = []
+  for name, cmd in cmds.items():
+    if not isinstance(cmd, Command):
+      continue
+    if cmd.return_type is Parameter.empty:
+      continue
+    method = msgspec.defstruct(
+      name,
+      [("params", cmd.params_type[1]), ("result", cmd.return_type)],
+      forbid_unknown_fields=True,
+    )
+    remote_procedures.append((name, method))
+  schema = msgspec.json.schema(
+    msgspec.defstruct(
+      "RemoteProcedures", remote_procedures, forbid_unknown_fields=True
+    ),
+    schema_hook=schema_hook,
+  )
+  if root := schema.get("$ref"):
+    assert isinstance(root, str)
+    assert root.startswith("#/$defs/")
+    root_type = schema["$defs"][root[len("#/$defs/") :]]
+    assert isinstance(root_type, dict)
+    root_type = copy.deepcopy(root_type)
+    root_type["$defs"] = schema["$defs"]
+    schema = root_type
+  process = subprocess.run(
+    ["bunx", "-y", "json-schema-to-typescript"],
+    check=True,
+    capture_output=True,
+    input=json.dumps(schema).encode("utf-8"),
+  )
+  with open("./src/rpc.methods.ts", "wb") as f:
+    f.write(process.stdout)

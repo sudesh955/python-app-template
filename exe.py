@@ -4,14 +4,17 @@ import importlib
 import os
 import sys
 from inspect import Parameter, signature
+from typing import Any, Literal
 
-from app.cmd import execute
+import msgspec
+
+from app.cmd import cmd_to_params
+from app.context import create_app_context
+from app.message import convert_message
+from app.types import AppContextT
 
 
 def get_module_name(argv: list[str]) -> str:
-  assert len(argv) >= 2, "Must specify .py file."
-  assert argv[1].endswith(".py"), "Must specify .py file."
-
   path = os.path.relpath(argv[1])[:-3]
   module = []
   while path:
@@ -25,44 +28,39 @@ def get_module_name(argv: list[str]) -> str:
   return module
 
 
-def parse_parameters_from_argv(argv: list[str]):
-  if len(argv) < 4:
-    return [], {}
-
-  argv = argv[3:]
-  args, kwargs = [], {}
-
-  cursor = 0
-  while cursor < len(argv):
-    arg = argv[cursor]
-    if arg.startswith("--"):
-      assert cursor + 1 < len(argv), "'{}' does not have a value".format(arg)
-      kwargs[arg[2:]] = argv[cursor + 1]
-      cursor += 2
-    else:
-      args.append(arg)
-      cursor += 1
-  return args, kwargs
+type ParamsType = tuple[Literal["single", "multiple"], type]
 
 
-def get_fn_parameters_from_argv(fn, argv: list[str]):
-  args, kwargs = parse_parameters_from_argv(argv)
-  parameters = {}
-  for index, param in enumerate(signature(fn).parameters.values()):
-    assert param.kind == Parameter.POSITIONAL_OR_KEYWORD, (
-      "Parameter '{}' is not supported".format(param.name)
+def get_params_type(method: str, fn: Any) -> tuple[bool, ParamsType]:
+  s = signature(fn)
+  parameters = s.parameters
+  names = list(parameters.keys())
+  requires_context = (
+    len(names) > 0
+    and names[0] == "ctx"
+    and (
+      parameters["ctx"].annotation is AppContextT
+      or parameters["ctx"].annotation == "AppContextT"
     )
-
-    annotation = param.annotation
-    if annotation == Parameter.empty:
-      annotation = str
-    if index < len(args):
-      parameters[param.name] = annotation(args[index])
-    elif param.name in kwargs:
-      parameters[param.name] = annotation(kwargs[param.name])
-    elif param.default == Parameter.empty:
-      raise Exception("Parameter '{}' is required".format(param.name))
-  return parameters
+  )
+  is_single = (
+    requires_context and len(s.parameters) == 2 and names[1] == "params"
+  )
+  if is_single:
+    return True, ("single", s.parameters["params"].annotation)
+  if requires_context:
+    names = names[1:]
+  fields = [
+    (name, parameters[name].annotation, parameters[name].default)
+    if parameters[name].default is not Parameter.empty
+    else (name, parameters[name].annotation)
+    for name in names
+  ]
+  struct = msgspec.defstruct(
+    method.title().replace("_", "") + "Params",
+    fields,
+  )
+  return requires_context, ("multiple", struct)
 
 
 def load_argv() -> list[str]:
@@ -70,7 +68,7 @@ def load_argv() -> list[str]:
   try:
     with open("etc/argv") as f:
       lines = f.readlines()
-  except Exception:
+  except OSError:
     return argv
   lines = [line.strip() for line in lines]
   lines = [line for line in lines if not line.startswith("#")]
@@ -83,39 +81,34 @@ def load_argv() -> list[str]:
   return lines
 
 
-def load_env():
-  with open("etc/env") as f:
-    lines = f.readlines()
-  lines = [line.strip() for line in lines]
-  lines = [line for line in lines if not line.startswith("#")]
-  lines = [line.strip() for line in lines]
-  lines = [line for line in lines if line]
-  for line in lines:
-    parts = line.split("=")
-    assert len(parts) == 2
-    k, v = parts[0].strip(), parts[1].strip()
-    os.environ[k] = v
-
-
 def main():
-  try:
-    load_env()
-  except Exception:
-    pass
-
   argv = load_argv()
+  if len(argv) < 2:
+    raise RuntimeError("filename is required")
+  if not argv[1].endswith(".py"):
+    raise RuntimeError("filename must end with .py")
   module_name = get_module_name(argv)
   module = importlib.import_module(module_name)
 
-  if execute(argv[2:]):
-    return
-
   fn_name = argv[2] if len(argv) > 2 else "main"
   fn = getattr(module, fn_name, None)
-  assert fn is not None, "{} is not defiend in {}".format(fn_name, module_name)
-
-  parameters = get_fn_parameters_from_argv(fn, argv)
-  result = fn(**parameters)
+  if fn is None:
+    fn = getattr(module, "main", None)
+  if fn is None:
+    raise RuntimeError(f"{fn_name} is not definend in {module_name}")
+  requires_context, params_type = get_params_type(fn_name, fn)
+  data = cmd_to_params(" ".join(argv[3:]), params_type[1])
+  struct = convert_message(data, params_type[1])
+  params = (
+    {"params": struct}
+    if params_type[0] == "single"
+    else msgspec.structs.asdict(struct)
+  )
+  if requires_context:
+    params["ctx"] = create_app_context()
+  result = fn(**params)
+  if callable(result):
+    result = result()
   if result is not None:
     print(result)
 

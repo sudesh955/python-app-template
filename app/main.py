@@ -1,6 +1,6 @@
+from app.cmd import cmd
 from app.config import load_config
 from app.context import AppContext
-from app.cmd import cmd
 
 
 @cmd("hello")
