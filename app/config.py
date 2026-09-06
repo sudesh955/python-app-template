@@ -7,6 +7,6 @@ class AppConfig(Struct): ...
 
 
 def load_config(filename: str) -> AppConfig:
-  with open(filename, "rb") as f:
-    data = tomli.load(f)
-  return convert_message(data, AppConfig)
+	with open(filename, "rb") as f:
+		data = tomli.load(f)
+	return convert_message(data, AppConfig)
